@@ -13,7 +13,9 @@ Run locally:  streamlit run app.py
 import io
 import json
 import os
+import random
 import re
+import time
 
 import streamlit as st
 from google import genai
@@ -26,10 +28,15 @@ from docx import Document
 # --------------------------------------------------------------------------- #
 # Edit this list if Google renames / retires models. The first one is the
 # default; the others are used as automatic fallbacks if a model is not found.
-MODEL_CHOICES = ["gemini-3.4-flash", "gemini-2.5-flash"]
+MODEL_CHOICES = ["gemini-3.8-flash", "gemini-3.7-flash"]
+# Names Google has retired. They are ignored even if set via GEMINI_MODEL / secrets.
+RETIRED_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash",
+                  "gemini-2.0-flash-lite", "gemini-1.5-flash", "gemini-1.5-pro"}
+APP_VERSION = "2026-10-15-b"  # shown in the sidebar so you can confirm which file is running
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
 MAX_JD_CHARS = 8_000
+MAX_ATTEMPTS_PER_MODEL = 3  # retries for temporary errors (503 / overloaded)
 AI_WEIGHT = 0.7  # final score = 70% Gemini + 30% rule-based checks
 RULE_WEIGHT = 1 - AI_WEIGHT
 
@@ -347,26 +354,50 @@ def _is_model_not_found(exc: Exception) -> bool:
     return any(s in msg for s in ("404", "not_found", "not found", "no longer available"))
 
 
+def _is_temporary_error(exc: Exception) -> bool:
+    """Server-side hiccups worth retrying: overloaded / unavailable / timeouts."""
+    msg = str(exc).lower()
+    if "429" in msg or "resource_exhausted" in msg:  # quota problems are not temporary blips
+        return False
+    if re.search(r"\b(500|502|503|504)\b", msg):
+        return True
+    return any(s in msg for s in ("unavailable", "overloaded", "high demand",
+                                  "internal error", "deadline", "timed out", "timeout"))
+
+
 def call_gemini(api_key: str, models: list, prompt: str):
-    """Call Gemini, falling back through `models` if a model name is not found."""
+    """Call Gemini with retries.
+
+    - Temporary errors (503 etc.): retry with exponential backoff, then try the next model.
+    - Model not found (404): try the next model immediately.
+    - Anything else (bad key, quota, ...): raise right away.
+    """
     client = genai.Client(api_key=api_key)
     config = types.GenerateContentConfig(
         temperature=0.2,
         response_mime_type="application/json",
     )
     last_error = None
+    temp_error = None  # remembered so a later 404 doesn't hide an overload message
     for model in models:
-        try:
-            response = client.models.generate_content(model=model, contents=prompt, config=config)
-            text = getattr(response, "text", None)
-            if not text:
-                raise ValueError("Gemini returned an empty response (it may have been blocked).")
-            return text, model
-        except Exception as exc:  # noqa: BLE001 - we re-raise unless it's a missing model
-            last_error = exc
-            if not _is_model_not_found(exc):
-                raise
-    raise last_error
+        for attempt in range(MAX_ATTEMPTS_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=model, contents=prompt, config=config)
+                text = getattr(response, "text", None)
+                if not text:
+                    raise ValueError("Gemini returned an empty response (it may have been blocked).")
+                return text, model
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last_error = exc
+                if _is_model_not_found(exc):
+                    break  # go to next model
+                if not _is_temporary_error(exc):
+                    raise
+                temp_error = exc
+                if attempt < MAX_ATTEMPTS_PER_MODEL - 1:
+                    time.sleep(2 ** attempt + random.random())  # ~1s, ~2s
+        # retries exhausted (or model not found) -> fall through to next model
+    raise temp_error or last_error
 
 
 def analyze_resume(api_key: str, models: list, resume_text: str, jd_text: str):
@@ -401,6 +432,9 @@ def friendly_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low and ("invalid" in low or "not valid" in low):
         return "Your Gemini API key looks invalid. Check it in the sidebar."
+    if "503" in msg or "unavailable" in low or "high demand" in low:
+        return ("Gemini is overloaded right now (503). The app already retried and tried the "
+                "backup model. Please wait a minute and click Analyze again, or pick another model.")
     if "429" in msg or "resource_exhausted" in low or "quota" in low:
         return "Gemini rate limit / quota reached. Wait a minute and try again."
     if "403" in msg or "permission" in low:
@@ -597,14 +631,18 @@ def main() -> None:
         st.header("Settings")
         key_input = st.text_input("Gemini API key", type="password",
                                   help="Get a free key at https://aistudio.google.com/apikey")
-        default_model = os.environ.get("GEMINI_MODEL", MODEL_CHOICES[0])
+        default_model = os.environ.get("GEMINI_MODEL", MODEL_CHOICES[0]).strip()
+        if default_model in RETIRED_MODELS or not default_model:
+            default_model = MODEL_CHOICES[0]  # ignore stale GEMINI_MODEL values
         options = MODEL_CHOICES if default_model in MODEL_CHOICES else [default_model] + MODEL_CHOICES
         model = st.selectbox("Model", options, index=options.index(default_model))
         st.caption("Your resume is sent to Google's Gemini API for analysis. "
                    "Nothing is stored by this app.")
+        st.caption(f"App version: {APP_VERSION}")
 
     api_key = get_api_key(key_input)
-    models = [model] + [m for m in MODEL_CHOICES if m != model]  # selected first, then fallbacks
+    models = [m for m in [model] + MODEL_CHOICES if m not in RETIRED_MODELS]
+    models = list(dict.fromkeys(models))  # selected first, then fallbacks, no duplicates
 
     uploaded = st.file_uploader("Resume (PDF, DOCX or TXT)", type=["pdf", "docx", "txt"])
     jd_text = st.text_area("Job description (optional - paste to get a match score)", height=160)
