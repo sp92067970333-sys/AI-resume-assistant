@@ -26,7 +26,7 @@ from docx import Document
 # --------------------------------------------------------------------------- #
 # Edit this list if Google renames / retires models. The first one is the
 # default; the others are used as automatic fallbacks if a model is not found.
-MODEL_CHOICES = ["gemini-3.5-flash", "gemini-2.5-flash"]
+MODEL_CHOICES = ["gemini-3.4-flash", "gemini-2.5-flash"]
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000
 MAX_JD_CHARS = 8_000
